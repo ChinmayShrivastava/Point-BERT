@@ -153,12 +153,15 @@ class LoRALayer(nn.Module):
 @MODELS.register_module()
 class PointTransformer(nn.Module):
     def __init__(self, config, dropout: float = 0.1, loss_type: LossType = LossType.MSE,
-                 use_lora: bool = False, lora_rank: int = 4, lora_alpha: float = 32, **kwargs):
+                 use_lora: bool = False, lora_rank: int = 4, lora_alpha: float = 32,
+                 use_few_shot: bool = False, num_shots: int = 5, **kwargs):
         super().__init__()
         self.config = config
         self.use_lora = use_lora
         self.lora_rank = lora_rank
         self.lora_alpha = lora_alpha
+        self.use_few_shot = use_few_shot
+        self.num_shots = num_shots
         self.npoints = config.npoints
         self.dropout = dropout
         self.loss_type = loss_type
@@ -217,6 +220,21 @@ class PointTransformer(nn.Module):
         # Add device tracking
         self.register_buffer('device_holder', torch.zeros(1))  # Used to track device
         
+        if use_few_shot:
+            # Cross-attention layer for few-shot conditioning
+            self.few_shot_attention = Attention(
+                dim=self.trans_dim,
+                num_heads=self.num_heads,
+                qkv_bias=True,
+                use_lora=use_lora,
+                lora_rank=lora_rank,
+                lora_alpha=lora_alpha
+            )
+            
+            # Memory bank for few-shot examples
+            self.register_buffer('few_shot_memory', None)
+            self.register_buffer('few_shot_count', torch.zeros(1, dtype=torch.long))
+
     def prepare_for_lora_training(self):
         fn_prepare_for_lora_training(self)
         
@@ -261,6 +279,35 @@ class PointTransformer(nn.Module):
 
         print_log(f'[Transformer] Successful Loading the ckpt from {bert_ckpt_path}', logger = 'Transformer')
     
+    def set_few_shot_examples(self, examples, displacements):
+        """
+        Store few-shot examples in memory
+        examples: (N, num_points, 3) - N example point clouds
+        displacements: (N, num_points, 3) - Corresponding displacements
+        """
+        if not self.use_few_shot:
+            return
+            
+        B = examples.shape[0]
+        if B > self.num_shots:
+            # If more examples provided than slots, randomly sample
+            indices = torch.randperm(B)[:self.num_shots]
+            examples = examples[indices]
+            displacements = displacements[indices]
+        
+        # Process examples through encoder
+        with torch.no_grad():
+            neighborhood, center = self.group_divider(examples)
+            group_tokens = self.encoder(neighborhood)
+            group_tokens = self.reduce_dim(group_tokens)
+            
+            # Store processed tokens and corresponding displacements
+            self.few_shot_memory = {
+                'tokens': group_tokens,
+                'displacements': displacements
+            }
+            self.few_shot_count[0] = examples.shape[0]
+
     def forward(self, input):
         # Convert input to correct dtype and device
         input = input.to(device=self.device_holder.device, dtype=self.dtype_holder.dtype)
@@ -281,6 +328,12 @@ class PointTransformer(nn.Module):
         x = torch.cat((cls_tokens, group_input_tokens), dim=1)
         pos = torch.cat((cls_pos, pos), dim=1)
         x = self.blocks(x, pos)
+        
+        if self.use_few_shot and self.few_shot_memory is not None:
+            # Cross attend to few-shot examples if available
+            few_shot_tokens = self.few_shot_memory['tokens'].to(x.device)
+            x = x + self.few_shot_attention(x, few_shot_tokens, few_shot_tokens)
+        
         x = self.norm(x)
         
         # Get global features
