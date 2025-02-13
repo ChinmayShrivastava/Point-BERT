@@ -13,13 +13,13 @@
 #include <ATen/cuda/CUDAApplyUtils.cuh>  // at::cuda::getApplyGrid
 #include <c10/cuda/CUDAGuard.h>
 
-#define CHECK_CUDA(x) TORCH_CHECK(x.type().is_cuda(), #x " must be a CUDA tensor")
+#define CHECK_CUDA(x) TORCH_CHECK(x.device().type() == at::kCUDA, #x " must be a CUDA tensor")
 #define CHECK_CONTIGUOUS(x) TORCH_CHECK(x.is_contiguous(), #x " must be contiguous")
 #define CHECK_INPUT(x) CHECK_CUDA(x); CHECK_CONTIGUOUS(x)
 
 #ifndef TORCH_CHECK_EQ
 #define TORCH_CHECK_EQ(val1, val2) CHECK_EQ(val1, val2)
-
+#endif
 
 /********************************
 * Forward kernel for approxmatch
@@ -184,8 +184,8 @@ at::Tensor ApproxMatchForward(
   CHECK_INPUT(xyz1);
   CHECK_INPUT(xyz2);
 
-  auto match = at::zeros({b, m, n}, xyz1.type());
-  auto temp = at::zeros({b, (n+m)*2}, xyz1.type());
+  auto match = at::zeros({b, m, n}, xyz1.options());
+  auto temp = at::zeros({b, (n+m)*2}, xyz1.options());
 
   AT_DISPATCH_FLOATING_TYPES(xyz1.scalar_type(), "ApproxMatchForward", ([&] {
         approxmatch<scalar_t><<<32,512>>>(b, n, m, xyz1.data<scalar_t>(), xyz2.data<scalar_t>(), match.data<scalar_t>(), temp.data<scalar_t>());

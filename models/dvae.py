@@ -2,7 +2,7 @@ import torch.nn as nn
 import torch
 import torch.nn.functional as F
 from knn_cuda import KNN
-from pointnet2_ops import pointnet2_utils
+# from pointnet2_ops import pointnet2_utils
 from .build import MODELS
 from utils import misc
 from extensions.chamfer_dist import ChamferDistanceL1, ChamferDistanceL2
@@ -111,41 +111,6 @@ class DGCNN(nn.Module):
 
         return f
 
-### ref https://github.com/Strawberry-Eat-Mango/PCT_Pytorch/blob/main/util.py ###
-def knn_point(nsample, xyz, new_xyz):
-    """
-    Input:
-        nsample: max sample number in local region
-        xyz: all points, [B, N, C]
-        new_xyz: query points, [B, S, C]
-    Return:
-        group_idx: grouped points index, [B, S, nsample]
-    """
-    sqrdists = square_distance(new_xyz, xyz)
-    _, group_idx = torch.topk(sqrdists, nsample, dim = -1, largest=False, sorted=False)
-    return group_idx
-
-def square_distance(src, dst):
-    """
-    Calculate Euclid distance between each two points.
-    src^T * dst = xn * xm + yn * ym + zn * zm；
-    sum(src^2, dim=-1) = xn*xn + yn*yn + zn*zn;
-    sum(dst^2, dim=-1) = xm*xm + ym*ym + zm*zm;
-    dist = (xn - xm)^2 + (yn - ym)^2 + (zn - zm)^2
-         = sum(src**2,dim=-1)+sum(dst**2,dim=-1)-2*src^T*dst
-    Input:
-        src: source points, [B, N, C]
-        dst: target points, [B, M, C]
-    Output:
-        dist: per-point square distance, [B, N, M]
-    """
-    B, N, _ = src.shape
-    _, M, _ = dst.shape
-    dist = -2 * torch.matmul(src, dst.permute(0, 2, 1))
-    dist += torch.sum(src ** 2, -1).view(B, N, 1)
-    dist += torch.sum(dst ** 2, -1).view(B, 1, M)
-    return dist    
-
 class Group(nn.Module):
     def __init__(self, num_group, group_size):
         super().__init__()
@@ -154,18 +119,10 @@ class Group(nn.Module):
         # self.knn = KNN(k=self.group_size, transpose_mode=True)
 
     def forward(self, xyz):
-        '''
-            input: B N 3
-            ---------------------------
-            output: B G M 3
-            center : B G 3
-        '''
+        xyz = xyz.float()  # Ensure float32
         batch_size, num_points, _ = xyz.shape
-        # fps the centers out
-        center = misc.fps(xyz, self.num_group) # B G 3
-        # knn to get the neighborhood
-        # _, idx = self.knn(xyz, center) # B G M
-        idx = knn_point(self.group_size, xyz, center) # B G M
+        center = misc.fps(xyz, self.num_group)
+        idx = misc.knn_point(self.group_size, xyz, center)
         assert idx.size(1) == self.num_group
         assert idx.size(2) == self.group_size
         idx_base = torch.arange(0, batch_size, device=xyz.device).view(-1, 1, 1) * num_points

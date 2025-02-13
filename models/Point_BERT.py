@@ -11,6 +11,8 @@ from utils import misc
 from utils.checkpoint import get_missing_parameters_message, get_unexpected_parameters_message
 from utils.logger import *
 import random
+from enum import Enum, auto
+import math
 
 
 
@@ -33,35 +35,52 @@ class Mlp(nn.Module):
         return x
 
 class Attention(nn.Module):
-    def __init__(self, dim, num_heads=8, qkv_bias=False, qk_scale=None, attn_drop=0., proj_drop=0.):
+    def __init__(self, dim, num_heads=8, qkv_bias=False, qk_scale=None, attn_drop=0., proj_drop=0., use_lora=False, lora_rank=4, lora_alpha=32):
         super().__init__()
         self.num_heads = num_heads
         head_dim = dim // num_heads
-        # NOTE scale factor was wrong in my original version, can set manually to be compat with prev weights
         self.scale = qk_scale or head_dim ** -0.5
+        self.use_lora = use_lora
 
+        # Original layers
         self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
         self.attn_drop = nn.Dropout(attn_drop)
         self.proj = nn.Linear(dim, dim)
         self.proj_drop = nn.Dropout(proj_drop)
 
+        # Add LoRA layers
+        if use_lora:
+            self.lora_qkv = LoRALayer(dim, dim * 3, rank=lora_rank, alpha=lora_alpha)
+            self.lora_proj = LoRALayer(dim, dim, rank=lora_rank, alpha=lora_alpha)
+
     def forward(self, x):
         B, N, C = x.shape
-        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
-        q, k, v = qkv[0], qkv[1], qkv[2]   # make torchscript happy (cannot use tensor as tuple)
+        
+        # Combine original and LoRA outputs for qkv
+        qkv = self.qkv(x)
+        if self.use_lora:
+            qkv = qkv + self.lora_qkv(x)
+        
+        qkv = qkv.reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv[0], qkv[1], qkv[2]
 
         attn = (q @ k.transpose(-2, -1)) * self.scale
         attn = attn.softmax(dim=-1)
         attn = self.attn_drop(attn)
 
         x = (attn @ v).transpose(1, 2).reshape(B, N, C)
+        
+        # Combine original and LoRA outputs for projection
         x = self.proj(x)
+        if self.use_lora:
+            x = x + self.lora_proj(x)
+            
         x = self.proj_drop(x)
         return x
 
 class Block(nn.Module):
     def __init__(self, dim, num_heads, mlp_ratio=4., qkv_bias=False, qk_scale=None, drop=0., attn_drop=0.,
-                 drop_path=0., act_layer=nn.GELU, norm_layer=nn.LayerNorm):
+                 drop_path=0., act_layer=nn.GELU, norm_layer=nn.LayerNorm, use_lora=False, lora_rank=4, lora_alpha=32):
         super().__init__()
         self.norm1 = norm_layer(dim)
 
@@ -72,7 +91,9 @@ class Block(nn.Module):
         self.mlp = Mlp(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=act_layer, drop=drop)
 
         self.attn = Attention(
-            dim, num_heads=num_heads, qkv_bias=qkv_bias, qk_scale=qk_scale, attn_drop=attn_drop, proj_drop=drop)
+            dim, num_heads=num_heads, qkv_bias=qkv_bias, qk_scale=qk_scale, attn_drop=attn_drop, proj_drop=drop,
+            use_lora=use_lora, lora_rank=lora_rank, lora_alpha=lora_alpha
+        )
         
     def forward(self, x):
         x = x + self.drop_path(self.attn(self.norm1(x)))
@@ -83,14 +104,22 @@ class TransformerEncoder(nn.Module):
     """ Transformer Encoder without hierarchical structure
     """
     def __init__(self, embed_dim=768, depth=4, num_heads=12, mlp_ratio=4., qkv_bias=False, qk_scale=None,
-        drop_rate=0., attn_drop_rate=0., drop_path_rate=0.):
+        drop_rate=0., attn_drop_rate=0., drop_path_rate=0., use_lora=False, lora_rank=4, lora_alpha=32):
         super().__init__()
         
         self.blocks = nn.ModuleList([
             Block(
-                dim=embed_dim, num_heads=num_heads, mlp_ratio=mlp_ratio, qkv_bias=qkv_bias, qk_scale=qk_scale,
-                drop=drop_rate, attn_drop=attn_drop_rate, 
-                drop_path = drop_path_rate[i] if isinstance(drop_path_rate, list) else drop_path_rate
+                dim=embed_dim, 
+                num_heads=num_heads, 
+                mlp_ratio=mlp_ratio, 
+                qkv_bias=qkv_bias, 
+                qk_scale=qk_scale,
+                drop=drop_rate, 
+                attn_drop=attn_drop_rate, 
+                drop_path=drop_path_rate[i] if isinstance(drop_path_rate, list) else drop_path_rate,
+                use_lora=use_lora,
+                lora_rank=lora_rank,
+                lora_alpha=lora_alpha
                 )
             for i in range(depth)])
 
@@ -99,11 +128,40 @@ class TransformerEncoder(nn.Module):
             x = block(x + pos)
         return x
 
+class LossType(Enum):
+    MSE = 'mse'
+    L1 = 'l1'
+    SmoothL1 = 'smooth_l1'
+
+class LoRALayer(nn.Module):
+    def __init__(self, in_dim, out_dim, rank=4, alpha=32):
+        super().__init__()
+        self.rank = rank
+        self.alpha = alpha
+        self.scaling = alpha / rank
+
+        self.lora_A = nn.Parameter(torch.zeros(in_dim, rank))
+        self.lora_B = nn.Parameter(torch.zeros(rank, out_dim))
+        
+        # Initialize weights
+        nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
+        nn.init.zeros_(self.lora_B)
+
+    def forward(self, x):
+        return (x @ self.lora_A @ self.lora_B) * self.scaling
+
 @MODELS.register_module()
 class PointTransformer(nn.Module):
-    def __init__(self, config, **kwargs):
+    def __init__(self, config, dropout: float = 0.1, loss_type: LossType = LossType.MSE,
+                 use_lora: bool = False, lora_rank: int = 4, lora_alpha: float = 32, **kwargs):
         super().__init__()
         self.config = config
+        self.use_lora = use_lora
+        self.lora_rank = lora_rank
+        self.lora_alpha = lora_alpha
+        self.npoints = config.npoints
+        self.dropout = dropout
+        self.loss_type = loss_type
 
         self.trans_dim = config.trans_dim
         self.depth = config.depth 
@@ -135,44 +193,45 @@ class PointTransformer(nn.Module):
             embed_dim = self.trans_dim,
             depth = self.depth,
             drop_path_rate = dpr,
-            num_heads = self.num_heads
+            num_heads = self.num_heads,
+            use_lora = use_lora,
+            lora_rank = lora_rank,
+            lora_alpha = lora_alpha
         )
 
         self.norm = nn.LayerNorm(self.trans_dim)
 
-        self.cls_head_finetune = nn.Sequential(
+        self.displacement_head = nn.Sequential(
             nn.Linear(self.trans_dim * 2, 256),
             nn.ReLU(inplace=True),
-            nn.Dropout(0.5),
-            nn.Linear(256, self.cls_dim)
+            nn.Dropout(self.dropout),
+            nn.Linear(256, 3),  # Output 3D displacement per point
+            nn.Tanh()  # Output range [-1, 1]
         )
 
         self.build_loss_func()
         
+        # Add dtype conversion in forward method
+        self.register_buffer('dtype_holder', torch.zeros(1))  # Used to match dtype
+        
+        # Add device tracking
+        self.register_buffer('device_holder', torch.zeros(1))  # Used to track device
+        
+    def prepare_for_lora_training(self):
+        fn_prepare_for_lora_training(self)
+        
     def build_loss_func(self):
-        self.loss_ce = nn.CrossEntropyLoss()
+        if self.loss_type == LossType.MSE:
+            self.loss_ce = nn.MSELoss()
+        elif self.loss_type == LossType.L1:
+            self.loss_ce = nn.L1Loss()
+        elif self.loss_type == LossType.SmoothL1:
+            self.loss_ce = nn.SmoothL1Loss()
     
-    def get_loss_acc(self, pred, gt, smoothing=True):
-        # import pdb; pdb.set_trace()
-        gt = gt.contiguous().view(-1).long()
-
-        if smoothing:
-            eps = 0.2
-            n_class = pred.size(1)
-
-            one_hot = torch.zeros_like(pred).scatter(1, gt.view(-1, 1), 1)
-            one_hot = one_hot * (1 - eps) + (1 - one_hot) * eps / (n_class - 1)
-            log_prb = F.log_softmax(pred, dim=1)
-
-            loss = -(one_hot * log_prb).sum(dim=1).mean()
-        else:
-            loss = self.loss_ce(pred, gt.long())
-
-        pred = pred.argmax(-1)
-        acc = (pred == gt).sum() / float(gt.size(0))
-
-        return loss, acc * 100
-
+    def get_loss(self, pred, gt):
+        # Ensure both tensors are on the same device
+        gt = gt.to(device=pred.device, dtype=pred.dtype)
+        return self.loss_ce(pred, gt)
 
     def load_model_from_ckpt(self, bert_ckpt_path):
         ckpt = torch.load(bert_ckpt_path)
@@ -201,28 +260,64 @@ class PointTransformer(nn.Module):
             )
 
         print_log(f'[Transformer] Successful Loading the ckpt from {bert_ckpt_path}', logger = 'Transformer')
-
-
-    def forward(self, pts):
-        # divide the point clo  ud in the same form. This is important
-        neighborhood, center = self.group_divider(pts)
-        # encoder the input cloud blocks
-        group_input_tokens = self.encoder(neighborhood)  #  B G N
+    
+    def forward(self, input):
+        # Convert input to correct dtype and device
+        input = input.to(device=self.device_holder.device, dtype=self.dtype_holder.dtype)
+        
+        B, N, _ = input.shape
+        
+        # Group and encode the input
+        neighborhood, center = self.group_divider(input)
+        group_input_tokens = self.encoder(neighborhood)  # B G C
         group_input_tokens = self.reduce_dim(group_input_tokens)
-        # prepare cls
-        cls_tokens = self.cls_token.expand(group_input_tokens.size(0), -1, -1)  
-        cls_pos = self.cls_pos.expand(group_input_tokens.size(0), -1, -1)  
-        # add pos embedding
+        
+        # Add cls token and position embedding
+        cls_tokens = self.cls_token.expand(B, -1, -1)
+        cls_pos = self.cls_pos.expand(B, -1, -1)
         pos = self.pos_embed(center)
-        # final input
+        
+        # Concatenate tokens and process through transformer
         x = torch.cat((cls_tokens, group_input_tokens), dim=1)
         pos = torch.cat((cls_pos, pos), dim=1)
-        # transformer
         x = self.blocks(x, pos)
         x = self.norm(x)
-        concat_f = torch.cat([x[:,0], x[:, 1:].max(1)[0]], dim = -1)
-        ret = self.cls_head_finetune(concat_f)
-        return ret
+        
+        # Get global features
+        global_features = x[:, 0]  # Take cls token features (B, C)
+        group_features = x[:, 1:]  # Take group token features (B, G, C)
+        
+        # Interpolate group features back to original points
+        group_points = center  # (B, G, 3)
+        input_points = input  # (B, N, 3)
+        
+        # Calculate distances between input points and group centers
+        input_points_expanded = input_points.unsqueeze(2)  # (B, N, 1, 3)
+        group_points_expanded = group_points.unsqueeze(1)  # (B, 1, G, 3)
+        distances = torch.sum((input_points_expanded - group_points_expanded) ** 2, dim=-1)  # (B, N, G)
+        
+        # Get k nearest group centers for each input point
+        k = 3  # number of nearest neighbors
+        _, indices = distances.topk(k, dim=-1, largest=False)  # (B, N, k)
+        
+        # Interpolate features from k nearest groups
+        weights = F.softmax(-distances, dim=-1)  # (B, N, G)
+        weights = weights.unsqueeze(-1)  # (B, N, G, 1)
+        
+        # Expand group features for each input point
+        group_features_expanded = group_features.unsqueeze(1).expand(-1, N, -1, -1)  # (B, N, G, C)
+        
+        # Weighted sum of features
+        interpolated_features = (group_features_expanded * weights).sum(dim=2)  # (B, N, C)
+        
+        # Expand global features and concatenate
+        global_features_expanded = global_features.unsqueeze(1).expand(-1, N, -1)  # (B, N, C)
+        combined_features = torch.cat([global_features_expanded, interpolated_features], dim=-1)
+        
+        # Generate displacements
+        displacements = self.displacement_head(combined_features)
+        
+        return displacements
 
 class MaskTransformer(nn.Module):
     def __init__(self, config, **kwargs):
@@ -230,18 +325,18 @@ class MaskTransformer(nn.Module):
         self.config = config
         # define the transformer argparse
         self.mask_ratio = config.transformer_config.mask_ratio 
-        self.trans_dim = config.transformer_config.trans_dim
+        self.trans_dim = config.transformer_config.trans_dim 
         self.depth = config.transformer_config.depth 
         self.drop_path_rate = config.transformer_config.drop_path_rate 
         self.cls_dim = config.transformer_config.cls_dim 
-        self.replace_pob = config.transformer_config.replace_pob
+        self.replace_pob = config.transformer_config.replace_pob 
         self.num_heads = config.transformer_config.num_heads 
-        print_log(f'[Transformer args] {config.transformer_config}', logger = 'dVAE BERT')
+        print_log(f'[Transformer args] {config.transformer_config}', logger = 'dVAE BERT') 
         # define the encoder
-        self.encoder_dims =  config.dvae_config.encoder_dims
-        self.encoder = Encoder(encoder_channel = self.encoder_dims)
-        # bridge encoder and transformer
-        self.reduce_dim = nn.Linear(self.encoder_dims,  self.trans_dim)
+        self.encoder_dims =  config.dvae_config.encoder_dims 
+        self.encoder = Encoder(encoder_channel = self.encoder_dims) 
+        # bridge encoder and transformer 
+        self.reduce_dim = nn.Linear(self.encoder_dims,  self.trans_dim) 
         try:
             self.mask_rand = config.mask_rand
         except:
@@ -602,3 +697,18 @@ def concat_all_gather(tensor):
 
     output = torch.cat(tensors_gather, dim=0)
     return output
+
+def fn_prepare_for_lora_training(model):
+    # Freeze all parameters
+    for param in model.parameters():
+        param.requires_grad = False
+    
+    # Unfreeze LoRA parameters
+    for module in model.modules():
+        if isinstance(module, LoRALayer):
+            for param in module.parameters():
+                param.requires_grad = True
+                
+    # Unfreeze displacement head parameters since it's new
+    for param in model.displacement_head.parameters():
+        param.requires_grad = True
