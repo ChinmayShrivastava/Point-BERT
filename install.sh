@@ -12,5 +12,5 @@ python setup.py install --user
 ln -s /home/ubuntu/.local/lib/python3.10/site-packages/chamfer-2.0.0-py3.10-linux-x86_64.egg/chamfer.cpython-310-x86_64-linux-gnu.so ./chamfer.so
 
 # EMD
-cd $HOME/extensions/emd
+cd extensions/emd
 python setup.py install --user
