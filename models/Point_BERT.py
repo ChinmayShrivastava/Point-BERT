@@ -35,7 +35,18 @@ class Mlp(nn.Module):
         return x
 
 class Attention(nn.Module):
-    def __init__(self, dim, num_heads=8, qkv_bias=False, qk_scale=None, attn_drop=0., proj_drop=0., use_lora=False, lora_rank=4, lora_alpha=32):
+    def __init__(
+        self, 
+        dim, 
+        num_heads=8, 
+        qkv_bias=False, 
+        qk_scale=None, 
+        attn_drop=0., 
+        proj_drop=0., 
+        use_lora=False, 
+        lora_rank=4, 
+        lora_alpha=32
+    ):
         super().__init__()
         self.num_heads = num_heads
         head_dim = dim // num_heads
@@ -132,6 +143,8 @@ class LossType(Enum):
     MSE = 'mse'
     L1 = 'l1'
     SmoothL1 = 'smooth_l1'
+    HUBER = 'huber'
+    WEIGHTED_PRESSURE = 'weighted_pressure'
 
 class LoRALayer(nn.Module):
     def __init__(self, in_dim, out_dim, rank=4, alpha=32):
@@ -154,7 +167,7 @@ class LoRALayer(nn.Module):
 class PointTransformer(nn.Module):
     def __init__(self, config, dropout: float = 0.1, loss_type: LossType = LossType.MSE,
                  use_lora: bool = False, lora_rank: int = 4, lora_alpha: float = 32,
-                 use_few_shot: bool = False, num_shots: int = 5, **kwargs):
+                 use_few_shot: bool = False, num_shots: int = 5, residuals: bool = False, **kwargs):
         super().__init__()
         self.config = config
         self.use_lora = use_lora
@@ -203,14 +216,24 @@ class PointTransformer(nn.Module):
         )
 
         self.norm = nn.LayerNorm(self.trans_dim)
-
-        self.displacement_head = nn.Sequential(
-            nn.Linear(self.trans_dim * 2, 256),
-            nn.ReLU(inplace=True),
-            nn.Dropout(self.dropout),
-            nn.Linear(256, 3),  # Output 3D displacement per point
-            nn.Tanh()  # Output range [-1, 1]
-        )
+        
+        self.residuals = residuals
+        if self.residuals:
+            self.finetuning_head = nn.Sequential(
+                nn.Linear(self.trans_dim * 3, 256),
+                nn.ReLU(inplace=True),
+                nn.Dropout(self.dropout),
+                nn.Linear(256, 1),  # Output 1 pressure value per point
+                nn.Sigmoid()  # Output range [0, 1]
+            )
+        else:
+            self.finetuning_head = nn.Sequential(
+                nn.Linear(self.trans_dim * 2, 256),
+                nn.ReLU(inplace=True),
+                nn.Dropout(self.dropout),
+                nn.Linear(256, 1),  # Output 1 pressure value per point
+                nn.Sigmoid()  # Output range [0, 1]
+            )
 
         self.build_loss_func()
         
@@ -226,17 +249,23 @@ class PointTransformer(nn.Module):
                 dim=self.trans_dim,
                 num_heads=self.num_heads,
                 qkv_bias=True,
-                use_lora=use_lora,
-                lora_rank=lora_rank,
-                lora_alpha=lora_alpha
+                use_lora=False,
+                lora_rank=0,
+                lora_alpha=0
             )
             
             # Memory bank for few-shot examples
-            self.register_buffer('few_shot_memory', None)
+            self.register_buffer('few_shot_tokens', None)
+            self.register_buffer('few_shot_displacements', None)
             self.register_buffer('few_shot_count', torch.zeros(1, dtype=torch.long))
+            
+        self.loss_weight_variance = 0.1
 
     def prepare_for_lora_training(self):
         fn_prepare_for_lora_training(self)
+        
+    def prepare_for_few_shot(self):
+        fn_prepare_for_few_shot(self)
         
     def build_loss_func(self):
         if self.loss_type == LossType.MSE:
@@ -245,22 +274,96 @@ class PointTransformer(nn.Module):
             self.loss_ce = nn.L1Loss()
         elif self.loss_type == LossType.SmoothL1:
             self.loss_ce = nn.SmoothL1Loss()
+        elif self.loss_type == LossType.HUBER:
+            self.loss_ce = nn.HuberLoss()
+        elif self.loss_type == LossType.WEIGHTED_PRESSURE:
+            # Initialize with MSE loss but will apply weights during calculation
+            self.loss_ce = nn.MSELoss(reduction='none')
+            # Default number of bins for pressure histogram
+            self.pressure_bins = 20
+            # Store histogram of pressure values for weight calculation
+            self.register_buffer('pressure_histogram', torch.zeros(self.pressure_bins))
+            self.register_buffer('total_samples', torch.zeros(1))
+            # Smoothing factor to avoid division by zero
+            self.histogram_smoothing = 0.1
+                
     
     def get_loss(self, pred, gt):
         # Ensure both tensors are on the same device
         gt = gt.to(device=pred.device, dtype=pred.dtype)
-        return self.loss_ce(pred, gt)
+        
+        if self.loss_type == LossType.WEIGHTED_PRESSURE:
+            # Update histogram of pressure values (during training)
+            if self.training:
+                # Create histogram of current batch
+                hist = torch.histc(gt, bins=self.pressure_bins, min=0.0, max=1.0)
+                # Update running histogram with exponential moving average
+                alpha = 0.9  # Smoothing factor for histogram update
+                self.pressure_histogram = alpha * self.pressure_histogram + (1 - alpha) * hist
+                self.total_samples += gt.numel()
+            
+            # Calculate weights based on inverse frequency
+            # Get bin indices for each gt value
+            bin_indices = (gt * self.pressure_bins).long().clamp(0, self.pressure_bins - 1)
+            
+            # Get weights from histogram (inverse frequency)
+            if self.total_samples > 0:
+                # Normalize histogram to get probabilities
+                probs = (self.pressure_histogram + self.histogram_smoothing) / (self.total_samples + self.pressure_bins * self.histogram_smoothing)
+                # Inverse frequency weighting
+                weights = 1.0 / (probs[bin_indices] * self.pressure_bins)
+                # Normalize weights to have mean=1
+                weights = weights / weights.mean()
+            else:
+                # If no samples seen yet, use uniform weights
+                weights = torch.ones_like(gt)
+            
+            # Calculate weighted MSE loss
+            element_wise_loss = self.loss_ce(pred, gt)
+            weighted_loss = (element_wise_loss * weights).mean()
+            
+            # Add variance matching term if configured
+            if hasattr(self, 'loss_weight_variance') and self.loss_weight_variance > 0:
+                gt_mean = gt.mean()
+                gt_var = ((gt - gt_mean) ** 2).mean()
+                pred_mean = pred.mean()
+                pred_var = ((pred - pred_mean) ** 2).mean()
+                
+                variance_loss = torch.abs(pred_var - gt_var)
+                return weighted_loss + self.loss_weight_variance * variance_loss
+            else:
+                return weighted_loss
+        elif self.loss_type == LossType.HUBER:
+            base_loss = F.huber_loss(pred, gt)
+            if hasattr(self, 'loss_weight_variance') and self.loss_weight_variance > 0:
+                gt_mean = gt.mean()
+                gt_var = ((gt - gt_mean) ** 2).mean()
+                pred_mean = pred.mean()
+                pred_var = ((pred - pred_mean) ** 2).mean()
+                
+                variance_loss = torch.abs(pred_var - gt_var)
+                return base_loss + self.loss_weight_variance * variance_loss
+            else:
+                return base_loss
+        else:
+            return self.loss_ce(pred, gt)
 
     def load_model_from_ckpt(self, bert_ckpt_path):
         ckpt = torch.load(bert_ckpt_path)
-        base_ckpt = {k.replace("module.", ""): v for k, v in ckpt['base_model'].items()}
-        for k in list(base_ckpt.keys()):
-            if k.startswith('transformer_q') and not k.startswith('transformer_q.cls_head'):
-                base_ckpt[k[len('transformer_q.'):]] = base_ckpt[k]
-            elif k.startswith('base_model'):
-                base_ckpt[k[len('base_model.'):]] = base_ckpt[k]
-            del base_ckpt[k]
-
+        
+        # Handle both old and new checkpoint formats
+        if 'model_state_dict' in ckpt:
+            # New format from finetune_few_shot.py
+            base_ckpt = {k.replace("module.", ""): v for k, v in ckpt['model_state_dict'].items()}
+        else:
+            # Original format
+            base_ckpt = {k.replace("module.", ""): v for k, v in ckpt['base_model'].items()}
+            for k in list(base_ckpt.keys()):
+                if k.startswith('transformer_q') and not k.startswith('transformer_q.cls_head'):
+                    base_ckpt[k[len('transformer_q.'):]] = base_ckpt[k]
+                elif k.startswith('base_model'):
+                    base_ckpt[k[len('base_model.'):]] = base_ckpt[k]
+                del base_ckpt[k]
 
         incompatible = self.load_state_dict(base_ckpt, strict=False)
 
@@ -282,33 +385,71 @@ class PointTransformer(nn.Module):
     def set_few_shot_examples(self, examples, displacements):
         """
         Store few-shot examples in memory
-        examples: (N, num_points, 3) - N example point clouds
+        examples: (N, num_points, 3) - N example point clouds (can be more than num_shots)
         displacements: (N, num_points, 3) - Corresponding displacements
         """
         if not self.use_few_shot:
             return
             
-        B = examples.shape[0]
-        if B > self.num_shots:
-            # If more examples provided than slots, randomly sample
-            indices = torch.randperm(B)[:self.num_shots]
-            examples = examples[indices]
-            displacements = displacements[indices]
+        # Validate inputs
+        if examples.shape[0] != displacements.shape[0]:
+            raise ValueError("Number of examples and displacements must match")
+        if examples.shape[1:] != displacements.shape[1:]:
+            raise ValueError("Shape of examples and displacements must match")
         
-        # Process examples through encoder
+        # Process all examples through encoder
         with torch.no_grad():
             neighborhood, center = self.group_divider(examples)
             group_tokens = self.encoder(neighborhood)
             group_tokens = self.reduce_dim(group_tokens)
             
-            # Store processed tokens and corresponding displacements
-            self.few_shot_memory = {
-                'tokens': group_tokens,
-                'displacements': displacements
-            }
+            # Store processed tokens and corresponding displacements as buffers
+            self.register_buffer('few_shot_tokens', group_tokens)  # Shape: (N, G, C)
+            self.register_buffer('few_shot_displacements', displacements)  # Shape: (N, num_points, 3)
             self.few_shot_count[0] = examples.shape[0]
+        
+        print_log(f'[Few-Shot] Stored {examples.shape[0]} examples in memory bank', logger='Transformer')
+
+    def select_relevant_shots(self, input_tokens, k=None):
+        """
+        Select the most relevant few-shot examples based on feature similarity
+        
+        Args:
+            input_tokens: (B, G, C) - Current input tokens
+            k: Optional int - Number of shots to select (defaults to self.num_shots)
+        
+        Returns:
+            selected_tokens: (B, k, G, C) - Selected few-shot tokens
+            selected_displacements: (B, k, N, 3) - Corresponding displacements
+        """
+        if k is None:
+            k = self.num_shots
+        
+        # Ensure k is an integer
+        if isinstance(k, torch.Tensor):
+            k = k.item()
+        
+        # Average pool tokens to get a single vector per example
+        input_features = input_tokens.mean(dim=1)  # (B, C)
+        memory_features = self.few_shot_tokens.mean(dim=1)  # (N, C)
+        
+        # Calculate cosine similarity
+        similarity = F.normalize(input_features, dim=-1) @ F.normalize(memory_features, dim=-1).T  # (B, N)
+        
+        # Get top k most similar examples for each input
+        _, indices = similarity.topk(k, dim=-1)  # (B, k)
+        
+        # Gather selected tokens and displacements
+        B = input_tokens.shape[0]
+        selected_tokens = self.few_shot_tokens[indices]  # (B, k, G, C)
+        selected_displacements = self.few_shot_displacements[indices]  # (B, k, N, 3)
+        
+        return selected_tokens, selected_displacements
 
     def forward(self, input):
+        if self.use_few_shot and self.few_shot_tokens is None:
+            print_log('[Warning] Few-shot learning is enabled but no examples have been set. The model will run without few-shot conditioning.', logger='Transformer')
+        
         # Convert input to correct dtype and device
         input = input.to(device=self.device_holder.device, dtype=self.dtype_holder.dtype)
         
@@ -329,11 +470,37 @@ class PointTransformer(nn.Module):
         pos = torch.cat((cls_pos, pos), dim=1)
         x = self.blocks(x, pos)
         
-        if self.use_few_shot and self.few_shot_memory is not None:
-            # Cross attend to few-shot examples if available
-            few_shot_tokens = self.few_shot_memory['tokens'].to(x.device)
-            x = x + self.few_shot_attention(x, few_shot_tokens, few_shot_tokens)
-        
+        if self.use_few_shot and self.few_shot_tokens is not None:
+            # Select relevant few-shot examples
+            few_shot_tokens, few_shot_displacements = self.select_relevant_shots(
+                group_input_tokens
+            )
+            
+            # Ensure consistent dtype
+            few_shot_tokens = few_shot_tokens.to(dtype=self.dtype_holder.dtype)
+            few_shot_displacements = few_shot_displacements.to(dtype=self.dtype_holder.dtype)
+            
+            # Reshape for batch processing
+            B, k, G, C = few_shot_tokens.shape
+            _, _, N, _ = few_shot_displacements.shape
+            
+            # Create combined representation of input geometry and target displacement
+            few_shot_tokens_flat = few_shot_tokens.view(B, k * G, C)
+            few_shot_disps_flat = few_shot_displacements.view(B, k * N, 3)
+            
+            # Project displacements to same dimension as tokens
+            displacement_projection = nn.Linear(3, C).to(device=few_shot_tokens.device, dtype=self.dtype_holder.dtype)
+            displacement_features = displacement_projection(few_shot_disps_flat)
+            
+            # Combine geometric features with displacement features
+            few_shot_combined = few_shot_tokens_flat + displacement_features[:, :k*G]
+            
+            # Concatenate input and few-shot features for self-attention
+            x = torch.cat([x, few_shot_combined], dim=1)
+            x = self.few_shot_attention(x)
+            # Take only the original sequence length
+            x = x[:, :x.size(1)-few_shot_combined.size(1)]
+
         x = self.norm(x)
         
         # Get global features
@@ -351,9 +518,7 @@ class PointTransformer(nn.Module):
         
         # Get k nearest group centers for each input point
         k = 3  # number of nearest neighbors
-        _, indices = distances.topk(k, dim=-1, largest=False)  # (B, N, k)
-        
-        # Interpolate features from k nearest groups
+        # Since we only need distances for the weights, we don't need to calculate indices
         weights = F.softmax(-distances, dim=-1)  # (B, N, G)
         weights = weights.unsqueeze(-1)  # (B, N, G, 1)
         
@@ -365,12 +530,25 @@ class PointTransformer(nn.Module):
         
         # Expand global features and concatenate
         global_features_expanded = global_features.unsqueeze(1).expand(-1, N, -1)  # (B, N, C)
-        combined_features = torch.cat([global_features_expanded, interpolated_features], dim=-1)
+        
+        if self.residuals:
+            # use self.pos_embed to embed all the input points
+            input_pos_embed = self.pos_embed(input)  # (B, N, C)
+            
+            combined_features = torch.cat([global_features_expanded, interpolated_features, input_pos_embed], dim=-1)  # (B, N, 3C)
+        else:
+            combined_features = torch.cat([global_features_expanded, interpolated_features], dim=-1)  # (B, N, 2C)
         
         # Generate displacements
-        displacements = self.displacement_head(combined_features)
+        finetuned_output = self.finetuning_head(combined_features)
         
-        return displacements
+        return finetuned_output
+
+    def clear_few_shot_memory(self):
+        """Clear stored few-shot examples"""
+        self.register_buffer('few_shot_tokens', None)
+        self.register_buffer('few_shot_displacements', None)
+        self.few_shot_count[0] = 0
 
 class MaskTransformer(nn.Module):
     def __init__(self, config, **kwargs):
@@ -763,5 +941,11 @@ def fn_prepare_for_lora_training(model):
                 param.requires_grad = True
                 
     # Unfreeze displacement head parameters since it's new
-    for param in model.displacement_head.parameters():
+    for param in model.finetuning_head.parameters():
         param.requires_grad = True
+        
+def fn_prepare_for_few_shot(model):
+    for param in model.parameters():
+        param.requires_grad = False
+    model.few_shot_attention.requires_grad_(True)
+    model.finetuning_head.requires_grad_(True)
