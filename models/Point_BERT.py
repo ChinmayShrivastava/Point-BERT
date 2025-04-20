@@ -456,7 +456,7 @@ class PointTransformer(nn.Module):
         B, N, _ = input.shape
         
         # Group and encode the input
-        neighborhood, center = self.group_divider(input)
+        neighborhood, center = self.group_divider(input) # B N G 3, B N 3
         group_input_tokens = self.encoder(neighborhood)  # B G C
         group_input_tokens = self.reduce_dim(group_input_tokens)
         
@@ -517,7 +517,7 @@ class PointTransformer(nn.Module):
         distances = torch.sum((input_points_expanded - group_points_expanded) ** 2, dim=-1)  # (B, N, G)
         
         # Get k nearest group centers for each input point
-        k = 3  # number of nearest neighbors
+        # k = 3  # number of nearest neighbors
         # Since we only need distances for the weights, we don't need to calculate indices
         weights = F.softmax(-distances, dim=-1)  # (B, N, G)
         weights = weights.unsqueeze(-1)  # (B, N, G, 1)
