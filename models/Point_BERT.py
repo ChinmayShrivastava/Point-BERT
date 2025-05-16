@@ -167,14 +167,12 @@ class LoRALayer(nn.Module):
 class PointTransformer(nn.Module):
     def __init__(self, config, dropout: float = 0.1, loss_type: LossType = LossType.MSE,
                  use_lora: bool = False, lora_rank: int = 4, lora_alpha: float = 32,
-                 use_few_shot: bool = False, num_shots: int = 5, residuals: bool = False, **kwargs):
+                 residuals: bool = False, **kwargs):
         super().__init__()
         self.config = config
         self.use_lora = use_lora
         self.lora_rank = lora_rank
         self.lora_alpha = lora_alpha
-        self.use_few_shot = use_few_shot
-        self.num_shots = num_shots
         self.npoints = config.npoints
         self.dropout = dropout
         self.loss_type = loss_type
@@ -243,29 +241,10 @@ class PointTransformer(nn.Module):
         # Add device tracking
         self.register_buffer('device_holder', torch.zeros(1))  # Used to track device
         
-        if use_few_shot:
-            # Cross-attention layer for few-shot conditioning
-            self.few_shot_attention = Attention(
-                dim=self.trans_dim,
-                num_heads=self.num_heads,
-                qkv_bias=True,
-                use_lora=False,
-                lora_rank=0,
-                lora_alpha=0
-            )
-            
-            # Memory bank for few-shot examples
-            self.register_buffer('few_shot_tokens', None)
-            self.register_buffer('few_shot_displacements', None)
-            self.register_buffer('few_shot_count', torch.zeros(1, dtype=torch.long))
-            
         self.loss_weight_variance = 0.1
 
     def prepare_for_lora_training(self):
         fn_prepare_for_lora_training(self)
-        
-    def prepare_for_few_shot(self):
-        fn_prepare_for_few_shot(self)
         
     def build_loss_func(self):
         if self.loss_type == LossType.MSE:
@@ -381,75 +360,8 @@ class PointTransformer(nn.Module):
             )
 
         print_log(f'[Transformer] Successful Loading the ckpt from {bert_ckpt_path}', logger = 'Transformer')
-    
-    def set_few_shot_examples(self, examples, displacements):
-        """
-        Store few-shot examples in memory
-        examples: (N, num_points, 3) - N example point clouds (can be more than num_shots)
-        displacements: (N, num_points, 3) - Corresponding displacements
-        """
-        if not self.use_few_shot:
-            return
-            
-        # Validate inputs
-        if examples.shape[0] != displacements.shape[0]:
-            raise ValueError("Number of examples and displacements must match")
-        if examples.shape[1:] != displacements.shape[1:]:
-            raise ValueError("Shape of examples and displacements must match")
-        
-        # Process all examples through encoder
-        with torch.no_grad():
-            neighborhood, center = self.group_divider(examples)
-            group_tokens = self.encoder(neighborhood)
-            group_tokens = self.reduce_dim(group_tokens)
-            
-            # Store processed tokens and corresponding displacements as buffers
-            self.register_buffer('few_shot_tokens', group_tokens)  # Shape: (N, G, C)
-            self.register_buffer('few_shot_displacements', displacements)  # Shape: (N, num_points, 3)
-            self.few_shot_count[0] = examples.shape[0]
-        
-        print_log(f'[Few-Shot] Stored {examples.shape[0]} examples in memory bank', logger='Transformer')
-
-    def select_relevant_shots(self, input_tokens, k=None):
-        """
-        Select the most relevant few-shot examples based on feature similarity
-        
-        Args:
-            input_tokens: (B, G, C) - Current input tokens
-            k: Optional int - Number of shots to select (defaults to self.num_shots)
-        
-        Returns:
-            selected_tokens: (B, k, G, C) - Selected few-shot tokens
-            selected_displacements: (B, k, N, 3) - Corresponding displacements
-        """
-        if k is None:
-            k = self.num_shots
-        
-        # Ensure k is an integer
-        if isinstance(k, torch.Tensor):
-            k = k.item()
-        
-        # Average pool tokens to get a single vector per example
-        input_features = input_tokens.mean(dim=1)  # (B, C)
-        memory_features = self.few_shot_tokens.mean(dim=1)  # (N, C)
-        
-        # Calculate cosine similarity
-        similarity = F.normalize(input_features, dim=-1) @ F.normalize(memory_features, dim=-1).T  # (B, N)
-        
-        # Get top k most similar examples for each input
-        _, indices = similarity.topk(k, dim=-1)  # (B, k)
-        
-        # Gather selected tokens and displacements
-        B = input_tokens.shape[0]
-        selected_tokens = self.few_shot_tokens[indices]  # (B, k, G, C)
-        selected_displacements = self.few_shot_displacements[indices]  # (B, k, N, 3)
-        
-        return selected_tokens, selected_displacements
 
     def forward(self, input):
-        if self.use_few_shot and self.few_shot_tokens is None:
-            print_log('[Warning] Few-shot learning is enabled but no examples have been set. The model will run without few-shot conditioning.', logger='Transformer')
-        
         # Convert input to correct dtype and device
         input = input.to(device=self.device_holder.device, dtype=self.dtype_holder.dtype)
         
@@ -470,37 +382,6 @@ class PointTransformer(nn.Module):
         pos = torch.cat((cls_pos, pos), dim=1)
         x = self.blocks(x, pos)
         
-        if self.use_few_shot and self.few_shot_tokens is not None:
-            # Select relevant few-shot examples
-            few_shot_tokens, few_shot_displacements = self.select_relevant_shots(
-                group_input_tokens
-            )
-            
-            # Ensure consistent dtype
-            few_shot_tokens = few_shot_tokens.to(dtype=self.dtype_holder.dtype)
-            few_shot_displacements = few_shot_displacements.to(dtype=self.dtype_holder.dtype)
-            
-            # Reshape for batch processing
-            B, k, G, C = few_shot_tokens.shape
-            _, _, N, _ = few_shot_displacements.shape
-            
-            # Create combined representation of input geometry and target displacement
-            few_shot_tokens_flat = few_shot_tokens.view(B, k * G, C)
-            few_shot_disps_flat = few_shot_displacements.view(B, k * N, 3)
-            
-            # Project displacements to same dimension as tokens
-            displacement_projection = nn.Linear(3, C).to(device=few_shot_tokens.device, dtype=self.dtype_holder.dtype)
-            displacement_features = displacement_projection(few_shot_disps_flat)
-            
-            # Combine geometric features with displacement features
-            few_shot_combined = few_shot_tokens_flat + displacement_features[:, :k*G]
-            
-            # Concatenate input and few-shot features for self-attention
-            x = torch.cat([x, few_shot_combined], dim=1)
-            x = self.few_shot_attention(x)
-            # Take only the original sequence length
-            x = x[:, :x.size(1)-few_shot_combined.size(1)]
-
         x = self.norm(x)
         
         # Get global features
@@ -543,12 +424,6 @@ class PointTransformer(nn.Module):
         finetuned_output = self.finetuning_head(combined_features)
         
         return finetuned_output
-
-    def clear_few_shot_memory(self):
-        """Clear stored few-shot examples"""
-        self.register_buffer('few_shot_tokens', None)
-        self.register_buffer('few_shot_displacements', None)
-        self.few_shot_count[0] = 0
 
 class MaskTransformer(nn.Module):
     def __init__(self, config, **kwargs):
@@ -943,9 +818,3 @@ def fn_prepare_for_lora_training(model):
     # Unfreeze displacement head parameters since it's new
     for param in model.finetuning_head.parameters():
         param.requires_grad = True
-        
-def fn_prepare_for_few_shot(model):
-    for param in model.parameters():
-        param.requires_grad = False
-    model.few_shot_attention.requires_grad_(True)
-    model.finetuning_head.requires_grad_(True)

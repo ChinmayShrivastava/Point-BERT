@@ -151,3 +151,5 @@ plot/
 pretrain_weight
 
 segmentation/log
+
+*.db
