@@ -947,16 +947,43 @@ def concat_all_gather(tensor):
     return output
 
 def fn_prepare_for_lora_training(model):
-    # Freeze all parameters
+    # Freeze all parameters first
     for param in model.parameters():
         param.requires_grad = False
     
-    # Unfreeze LoRA parameters
+    # Unfreeze LoRA parameters in all attention modules
     for module in model.modules():
         if isinstance(module, LoRALayer):
             for param in module.parameters():
                 param.requires_grad = True
-                
-    # Unfreeze displacement head parameters since it's new
+    
+    # Unfreeze finetuning head (always needs to be trained)
     for param in model.finetuning_head.parameters():
         param.requires_grad = True
+    
+    # Unfreeze subsection-specific components
+    if hasattr(model, 'subsection_adapter'):
+        for param in model.subsection_adapter.parameters():
+            param.requires_grad = True
+    
+    if hasattr(model, 'subsection_pos_embed'):
+        model.subsection_pos_embed.requires_grad = True
+    
+    # Unfreeze cross-attention fusion mechanism
+    if hasattr(model, 'fusion'):
+        for param in model.fusion.parameters():
+            param.requires_grad = True
+    
+    # Unfreeze normalization layers
+    if hasattr(model, 'norm'):
+        for param in model.norm.parameters():
+            param.requires_grad = True
+    
+    if hasattr(model, 'subsection_norm'):
+        for param in model.subsection_norm.parameters():
+            param.requires_grad = True
+            
+    # Log trainable parameters
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    total_params = sum(p.numel() for p in model.parameters())
+    print(f"Trainable parameters: {trainable_params} / {total_params} ({trainable_params/total_params:.2%})")
