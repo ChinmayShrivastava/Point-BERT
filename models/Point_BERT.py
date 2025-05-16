@@ -187,11 +187,28 @@ class PointTransformer(nn.Module):
         self.num_group = config.num_group
         # grouper
         self.group_divider = Group(num_group = self.num_group, group_size = self.group_size)
-        # define the encoder
-        self.encoder_dims =  config.encoder_dims
+        # define the encoder (original for global points)
+        self.encoder_dims = config.encoder_dims
         self.encoder = Encoder(encoder_channel = self.encoder_dims)
+        
+        # Additional encoder for subsection (will be initialized from the original)
+        self.subsection_encoder = Encoder(encoder_channel = self.encoder_dims)
+        
         # bridge encoder and transformer
-        self.reduce_dim = nn.Linear(self.encoder_dims,  self.trans_dim)
+        self.reduce_dim = nn.Linear(self.encoder_dims, self.trans_dim)
+        
+        # Additional reduce_dim for subsection (will be initialized from the original)
+        self.subsection_reduce_dim = nn.Linear(self.encoder_dims, self.trans_dim)
+        
+        # Additional adapter for subsection features
+        self.subsection_adapter = nn.Sequential(
+            nn.Linear(self.trans_dim, self.trans_dim),
+            nn.LayerNorm(self.trans_dim),
+            nn.GELU()
+        )
+        
+        # Subsection position embedding (to encode which of the 4 subsections)
+        self.subsection_pos_embed = nn.Embedding(4, self.trans_dim)
 
         self.cls_token = nn.Parameter(torch.zeros(1, 1, self.trans_dim))
         self.cls_pos = nn.Parameter(torch.randn(1, 1, self.trans_dim))
@@ -203,6 +220,8 @@ class PointTransformer(nn.Module):
         )  
 
         dpr = [x.item() for x in torch.linspace(0, self.drop_path_rate, self.depth)]
+        
+        # Original transformer blocks (for global processing)
         self.blocks = TransformerEncoder(
             embed_dim = self.trans_dim,
             depth = self.depth,
@@ -212,8 +231,27 @@ class PointTransformer(nn.Module):
             lora_rank = lora_rank,
             lora_alpha = lora_alpha
         )
+        
+        # Additional blocks for subsection processing (will be initialized from original)
+        self.subsection_blocks = TransformerEncoder(
+            embed_dim = self.trans_dim,
+            depth = self.depth,
+            drop_path_rate = dpr,
+            num_heads = self.num_heads,
+            use_lora = use_lora,
+            lora_rank = lora_rank,
+            lora_alpha = lora_alpha
+        )
 
+        # Cross-attention for fusing global and subsection features
+        self.fusion = nn.MultiheadAttention(
+            embed_dim=self.trans_dim,
+            num_heads=self.num_heads,
+            dropout=dropout
+        )
+        
         self.norm = nn.LayerNorm(self.trans_dim)
+        self.subsection_norm = nn.LayerNorm(self.trans_dim)
         
         self.residuals = residuals
         if self.residuals:
@@ -242,6 +280,25 @@ class PointTransformer(nn.Module):
         self.register_buffer('device_holder', torch.zeros(1))  # Used to track device
         
         self.loss_weight_variance = 0.1
+        
+        # Initialize subsection components from original ones
+        self._initialize_subsection_components()
+        
+    def _initialize_subsection_components(self):
+        """Initialize subsection components from the original ones to preserve pretrained knowledge"""
+        # Copy encoder weights
+        self.subsection_encoder.load_state_dict(self.encoder.state_dict())
+        
+        # Copy reduce_dim weights
+        self.subsection_reduce_dim.weight.data.copy_(self.reduce_dim.weight.data)
+        self.subsection_reduce_dim.bias.data.copy_(self.reduce_dim.bias.data)
+        
+        # Initialize subsection adapter to be close to identity function initially
+        for m in self.subsection_adapter.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight, gain=0.01)
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
 
     def prepare_for_lora_training(self):
         fn_prepare_for_lora_training(self)
@@ -360,17 +417,18 @@ class PointTransformer(nn.Module):
             )
 
         print_log(f'[Transformer] Successful Loading the ckpt from {bert_ckpt_path}', logger = 'Transformer')
+        
+        # After loading weights, re-initialize subsection components
+        self._initialize_subsection_components()
 
-    def forward(self, input):
-        # Convert input to correct dtype and device
-        input = input.to(device=self.device_holder.device, dtype=self.dtype_holder.dtype)
+    def process_global_input(self, points):
+        """Process the global point cloud input"""
+        B = points.shape[0]
         
-        B, N, _ = input.shape
-        
-        # Group and encode the input
-        neighborhood, center = self.group_divider(input) # B N G 3, B N 3
-        group_input_tokens = self.encoder(neighborhood)  # B G C
-        group_input_tokens = self.reduce_dim(group_input_tokens)
+        # Group and encode the global input
+        neighborhood, center = self.group_divider(points)
+        tokens = self.encoder(neighborhood)
+        tokens = self.reduce_dim(tokens)
         
         # Add cls token and position embedding
         cls_tokens = self.cls_token.expand(B, -1, -1)
@@ -378,52 +436,136 @@ class PointTransformer(nn.Module):
         pos = self.pos_embed(center)
         
         # Concatenate tokens and process through transformer
-        x = torch.cat((cls_tokens, group_input_tokens), dim=1)
+        x = torch.cat((cls_tokens, tokens), dim=1)
         pos = torch.cat((cls_pos, pos), dim=1)
         x = self.blocks(x, pos)
-        
         x = self.norm(x)
         
-        # Get global features
-        global_features = x[:, 0]  # Take cls token features (B, C)
-        group_features = x[:, 1:]  # Take group token features (B, G, C)
+        return x, center
+
+    def process_subsection_input(self, points, subsection_idx):
+        """Process the subsection point cloud input"""
+        B = points.shape[0]
         
-        # Interpolate group features back to original points
-        group_points = center  # (B, G, 3)
-        input_points = input  # (B, N, 3)
+        # Group and encode the subsection input
+        neighborhood, center = self.group_divider(points)
+        tokens = self.subsection_encoder(neighborhood)
+        tokens = self.subsection_reduce_dim(tokens)
+        tokens = self.subsection_adapter(tokens)
         
+        # Add subsection position embedding
+        subsection_pos_tokens = self.subsection_pos_embed(subsection_idx).unsqueeze(1).expand(-1, tokens.size(1), -1)
+        tokens = tokens + subsection_pos_tokens
+        
+        # Add cls token and position embedding
+        cls_tokens = self.cls_token.expand(B, -1, -1)
+        cls_pos = self.cls_pos.expand(B, -1, -1)
+        pos = self.pos_embed(center)
+        
+        # Concatenate tokens and process through transformer
+        x = torch.cat((cls_tokens, tokens), dim=1)
+        pos = torch.cat((cls_pos, pos), dim=1)
+        x = self.subsection_blocks(x, pos)
+        x = self.subsection_norm(x)
+        
+        return x, center
+
+    def forward(self, input_data):
+        # Handle both single point cloud and dictionary input formats
+        if isinstance(input_data, dict):
+            # New input format with global and subsection
+            global_input = input_data['global_points']
+            subsection_input = input_data['subsection_points']
+            subsection_idx = input_data['subsection_idx']  # 0-3 indicating which subsection
+            
+            # Convert input to correct dtype and device
+            global_input = global_input.to(device=self.device_holder.device, dtype=self.dtype_holder.dtype)
+            subsection_input = subsection_input.to(device=self.device_holder.device, dtype=self.dtype_holder.dtype)
+            
+            # Get shapes
+            B, N, _ = subsection_input.shape
+            
+            # Process global and subsection inputs
+            global_x, _ = self.process_global_input(global_input)
+            subsection_x, subsection_center = self.process_subsection_input(subsection_input, subsection_idx)
+            
+            # Cross-attention fusion (use global features as query, subsection features as key/value)
+            # Reshape for multi-head attention (seq_len, batch, hidden_dim)
+            q = global_x[:, 1:].permute(1, 0, 2)  # Use global features without cls token
+            k = subsection_x[:, 1:].permute(1, 0, 2)  # Use subsection features without cls token
+            v = subsection_x[:, 1:].permute(1, 0, 2)
+            
+            # Apply cross-attention
+            fused_features, _ = self.fusion(q, k, v)
+            fused_features = fused_features.permute(1, 0, 2)  # (batch, seq_len, hidden_dim)
+            
+            # Get global cls token features
+            global_features = global_x[:, 0]  # (B, C)
+            
+            # Interpolate features to original points
+            subsection_points = subsection_center  # (B, G, 3)
+            input_points = subsection_input  # (B, N, 3)
+            
+        else:
+            # Legacy input format with only one point cloud
+            input_points = input_data.to(device=self.device_holder.device, dtype=self.dtype_holder.dtype)
+            B, N, _ = input_points.shape
+            
+            # Group and encode the input
+            neighborhood, center = self.group_divider(input_points)
+            group_input_tokens = self.encoder(neighborhood)
+            group_input_tokens = self.reduce_dim(group_input_tokens)
+            
+            # Add cls token and position embedding
+            cls_tokens = self.cls_token.expand(B, -1, -1)
+            cls_pos = self.cls_pos.expand(B, -1, -1)
+            pos = self.pos_embed(center)
+            
+            # Concatenate tokens and process through transformer
+            x = torch.cat((cls_tokens, group_input_tokens), dim=1)
+            pos = torch.cat((cls_pos, pos), dim=1)
+            x = self.blocks(x, pos)
+            
+            x = self.norm(x)
+            
+            # Get global features
+            global_features = x[:, 0]  # Take cls token features (B, C)
+            group_features = x[:, 1:]  # Take group token features (B, G, C)
+            
+            # Use the original features as fused features
+            fused_features = group_features
+            subsection_points = center
+            
         # Calculate distances between input points and group centers
         input_points_expanded = input_points.unsqueeze(2)  # (B, N, 1, 3)
-        group_points_expanded = group_points.unsqueeze(1)  # (B, 1, G, 3)
-        distances = torch.sum((input_points_expanded - group_points_expanded) ** 2, dim=-1)  # (B, N, G)
+        subsection_points_expanded = subsection_points.unsqueeze(1)  # (B, 1, G, 3)
+        distances = torch.sum((input_points_expanded - subsection_points_expanded) ** 2, dim=-1)  # (B, N, G)
         
-        # Get k nearest group centers for each input point
-        # k = 3  # number of nearest neighbors
-        # Since we only need distances for the weights, we don't need to calculate indices
+        # Get weights based on distances
         weights = F.softmax(-distances, dim=-1)  # (B, N, G)
         weights = weights.unsqueeze(-1)  # (B, N, G, 1)
         
-        # Expand group features for each input point
-        group_features_expanded = group_features.unsqueeze(1).expand(-1, N, -1, -1)  # (B, N, G, C)
+        # Expand fused features for each input point
+        fused_features_expanded = fused_features.unsqueeze(1).expand(-1, N, -1, -1)  # (B, N, G, C)
         
         # Weighted sum of features
-        interpolated_features = (group_features_expanded * weights).sum(dim=2)  # (B, N, C)
+        interpolated_features = (fused_features_expanded * weights).sum(dim=2)  # (B, N, C)
         
         # Expand global features and concatenate
         global_features_expanded = global_features.unsqueeze(1).expand(-1, N, -1)  # (B, N, C)
         
         if self.residuals:
-            # use self.pos_embed to embed all the input points
-            input_pos_embed = self.pos_embed(input)  # (B, N, C)
+            # Use self.pos_embed to embed all the input points
+            input_pos_embed = self.pos_embed(input_points)  # (B, N, C)
             
             combined_features = torch.cat([global_features_expanded, interpolated_features, input_pos_embed], dim=-1)  # (B, N, 3C)
         else:
             combined_features = torch.cat([global_features_expanded, interpolated_features], dim=-1)  # (B, N, 2C)
         
-        # Generate displacements
-        finetuned_output = self.finetuning_head(combined_features)
+        # Generate prediction
+        output = self.finetuning_head(combined_features)
         
-        return finetuned_output
+        return output
 
 class MaskTransformer(nn.Module):
     def __init__(self, config, **kwargs):
