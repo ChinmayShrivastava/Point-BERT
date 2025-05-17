@@ -293,6 +293,9 @@ class PointTransformer(nn.Module):
         self.subsection_reduce_dim.weight.data.copy_(self.reduce_dim.weight.data)
         self.subsection_reduce_dim.bias.data.copy_(self.reduce_dim.bias.data)
         
+        # Copy transformer blocks weights
+        self.subsection_blocks.load_state_dict(self.blocks.state_dict())
+        
         # Initialize subsection adapter to be close to identity function initially
         for m in self.subsection_adapter.modules():
             if isinstance(m, nn.Linear):
