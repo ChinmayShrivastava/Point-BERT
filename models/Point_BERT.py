@@ -480,6 +480,8 @@ class PointTransformer(nn.Module):
             global_input = input_data['global_points']
             subsection_input = input_data['subsection_points']
             subsection_idx = input_data['subsection_idx']  # 0-3 indicating which subsection
+            # ensure that the subsection_idx is in 0-3
+            assert subsection_idx.min() >= 0 and subsection_idx.max() <= 3, f"Subsection index must be in 0-3, got {subsection_idx.min()} and {subsection_idx.max()}"
             
             # Convert input to correct dtype and device
             global_input = global_input.to(device=self.device_holder.device, dtype=self.dtype_holder.dtype)
